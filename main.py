@@ -1,12 +1,14 @@
+
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import FileResponse, HTMLResponse
 import uvicorn
-import requests
+import aiohttp
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import quote
 import asyncio
 import os
+import time
 
 app = FastAPI()
 
@@ -15,46 +17,51 @@ def extract_image_url(html_content):
   soup = BeautifulSoup(html_content, 'html.parser')
   image_meta = soup.find('meta', property='og:image')
   if image_meta:
-    print(f"Found image URL: {image_meta['content']}")
     return image_meta['content']
-  print("Image URL not found")
   return None
 
 
-async def process_url(url, index, total):
+async def fetch(url, session):
+    async with session.get(url) as response:
+        return await response.text()
+
+
+async def process_url(session, url):
   try:
-    print(f"Processing URL {index+1}/{total}: {url}")
-    response = requests.get(url)
-    response.raise_for_status()
-    image_url = extract_image_url(response.content.decode('utf-8'))
+    html_content = await fetch(url, session)
+    image_url = extract_image_url(html_content)
     if image_url:
       return {"URL": url, "ImageURL": image_url}
     else:
       return {"URL": url, "Error": "Image URL not found"}
-  except requests.exceptions.HTTPError as err:
-    print(f"HTTP error encountered while processing {url}: {err}")
-    return {"URL": url, "Error": "HTTPError", "ErrorMessage": str(err)}
-  except requests.exceptions.RequestException as e:
-    print(f"Request exception encountered while processing {url}: {e}")
-    return {"URL": url, "Error": "RequestException", "ErrorMessage": str(e)}
+  except aiohttp.ClientError as err:
+    return {"URL": url, "Error": "ClientError", "ErrorMessage": str(err)}
+  except Exception as e:
+    return {"URL": url, "Error": "Unhandled exception", "ErrorMessage": str(e)}
+
+
+async def process_batch(urls):
+  async with aiohttp.ClientSession() as session:
+    tasks = [process_url(session, url) for url in urls]
+    return await asyncio.gather(*tasks)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
   return """
-    <html>
-        <head>
-            <title>Upload URLs File</title>
-        </head>
-        <body>
-            <h2>Upload File</h2>
-            <form action="/upload-file/" enctype="multipart/form-data" method="post">
-            <input name="file" type="file" accept=".txt">
-            <input type="submit">
-            </form>
-        </body>
-    </html>
-    """
+        <html>
+            <head>
+                <title>Upload URLs File</title>
+            </head>
+            <body>
+                <h2>Upload File</h2>
+                <form action="/upload-file/" enctype="multipart/form-data" method="post">
+                <input name="file" type="file" accept=".txt">
+                <input type="submit">
+                </form>
+            </body>
+        </html>
+        """
 
 
 @app.post("/upload-file/")
@@ -62,14 +69,29 @@ async def create_upload_file(file: UploadFile = File(...)):
   content = await file.read()
   urls = content.decode('utf-8').splitlines()
 
+  batch_size = 10  # Adjust the batch size as needed
+  batches = [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
+  total_urls = len(urls)
+
+  start_time = time.time()
+  processed_count = 0
+
   print("Starting to process the uploaded file...")
 
-  tasks = [
-      process_url(url, index, len(urls)) for index, url in enumerate(urls)
-  ]
-  images_info = await asyncio.gather(*tasks)
+  images_info = []
+  for batch in batches:
+    batch_result = await process_batch(batch)
+    images_info.extend(batch_result)
+    processed_count += len(batch)
+    elapsed_time = time.time() - start_time
+    remaining_urls = total_urls - processed_count
+    est_total_time = (elapsed_time / processed_count) * total_urls
+    remaining_time = est_total_time - elapsed_time
+    print(
+        f"Processed: {processed_count}/{total_urls} URLs. Estimated remaining time: {remaining_time:.2f} seconds."
+    )
 
-  print(f"Processing completed. Total URLs processed: {len(urls)}")
+  print(f"Processing completed. Total URLs processed: {total_urls}")
 
   if images_info:
     df = pd.DataFrame(images_info)
